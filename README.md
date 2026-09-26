@@ -28,7 +28,8 @@ reach positions 1–9.
 
 ![Reordering accounts](assets/reorder.png)
 
-**Routing settings.** Fill-first or round-robin, and session affinity on/off.
+**Routing settings.** Fill-first or round-robin, session affinity on/off, and
+when accounts switch (only on usage limits, or on any error).
 The current settings are pre-selected; Esc cancels without changing anything.
 
 ![Routing settings](assets/routing.png)
@@ -37,7 +38,9 @@ The current settings are pre-selected; Esc cancels without changing anything.
 not deleted — move it back to restore the account. An earlier removed copy with
 the same name is never overwritten.
 
-On first run, if routing isn't fill-first yet, it offers to switch:
+On first run, if routing isn't fill-first yet, it offers to switch. If it already
+is but accounts still switch on any error, it offers to make them switch only on
+usage limits:
 
 ![First run](assets/first-run.png)
 
@@ -56,13 +59,20 @@ On first run, if routing isn't fill-first yet, it offers to switch:
 - **Session affinity** off means requests strictly follow the order. On keeps a
   conversation on one account for better prompt caching, at the cost of strict
   ordering.
+- **Switch only on usage limits** (on by default when enabling fill-first) sets
+  `max-retry-credentials: 1` and `transient-error-cooldown-seconds: -1`. By default
+  CLIProxyAPI also hands over on network drops (a failed request tries every
+  account in the same round, so it can land on the next account when the
+  connection comes back) and on 5xx/529 errors (the account is benched for 60 s).
+  With this on, those retry the current account instead; a 429 rate limit, or a
+  401/403 from a broken login, still moves to the next account.
 - CLIProxyAPI hot-reloads its config and auth files — no restart needed.
 
 ## What it touches
 
 | Path | Change |
 | --- | --- |
-| CLIProxyAPI config | `routing.strategy` / `routing.session-affinity` only, keeping indentation, comments and line endings; a timestamped `.bak` copy is made first and the result is re-read before it's saved |
+| CLIProxyAPI config | `routing.strategy` / `routing.session-affinity`, plus top-level `max-retry-credentials` / `transient-error-cooldown-seconds` — nothing else, keeping indentation, comments and line endings; a timestamped `.bak` copy is made first and the result is re-read before it's saved |
 | Auth dir (`auth-dir`, default `~/.cli-proxy-api`) | new logins, plus a top-level `"priority"` field per account — written to a temp file in the same folder, then renamed, so CLIProxyAPI never sees a half-written file |
 | `~/.cli-proxy-api-removed` | accounts you remove |
 

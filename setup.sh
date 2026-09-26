@@ -289,11 +289,11 @@ function scalar(v,   q, rest, p) {
 function is_routing_line(s) { return s ~ /^routing:[ \t]*(#.*)?$/ }
 '
 
-yaml_root() { # key → value of a top-level key
+yaml_root() { # key [file] → value of a top-level key
   awk -v key="$1" "$YAML_AWK_LIB"'
     { line = strip_cr($0) }
     index(line, key ":") == 1 { print scalar(substr(line, length(key) + 2)); exit }
-  ' "$config"
+  ' "${2:-$config}"
 }
 
 routing_value() { # key [file] → value of routing.<key>
@@ -396,6 +396,51 @@ write_routing() { # strategy affinity(true|false)
     return 1
   fi
   cat "$tmp" >"$config" # keep the file's permissions, owner and symlinks
+  rm -f "$tmp"
+}
+
+# When accounts hand over. "limits": only a usage limit (429) moves traffic to
+# the next account. CLIProxyAPI's defaults also move it on network drops and
+# 5xx errors: a failed request tries every account in the same round, and a
+# 5xx sidelines the account for 60 s.
+switch_mode() {
+  if [[ "$(yaml_root max-retry-credentials)" == 1 && "$(yaml_root transient-error-cooldown-seconds)" == -1 ]]; then
+    echo limits
+  else
+    echo any
+  fi
+}
+
+write_switching() { # limits|any
+  local tmp creds=0 cooldown=0
+  [[ "$1" == limits ]] && creds=1 && cooldown=-1
+  backup_config
+  tmp="$(mktemp "$config.XXXXXX")"
+  awk -v creds="$creds" -v cooldown="$cooldown" "$YAML_AWK_LIB"'
+    FNR == 1 { pass++ }
+    pass == 1 { if ($0 ~ /\r$/) crlf = 1; next }
+    pass == 2 && FNR == 1 { eol = crlf ? "\r" : "" }
+    {
+      line = strip_cr($0)
+      note = match(line, /[ \t]+#.*$/) ? substr(line, RSTART) : ""
+      if (index(line, "max-retry-credentials:") == 1) { print "max-retry-credentials: " creds note eol; has_c = 1; next }
+      if (index(line, "transient-error-cooldown-seconds:") == 1) { print "transient-error-cooldown-seconds: " cooldown note eol; has_t = 1; next }
+      print
+    }
+    END {
+      if (!has_c) print "max-retry-credentials: " creds eol
+      if (!has_t) print "transient-error-cooldown-seconds: " cooldown eol
+    }
+  ' "$config" "$config" >"$tmp"
+
+  if [[ "$(yaml_root max-retry-credentials "$tmp")" != "$creds" ||
+    "$(yaml_root transient-error-cooldown-seconds "$tmp")" != "$cooldown" ]]; then
+    rm -f "$tmp"
+    warn "Couldn't update account switching in $config — it was left unchanged."
+    note "Set it by hand:  max-retry-credentials: $creds, transient-error-cooldown-seconds: $cooldown"
+    return 1
+  fi
+  cat "$tmp" >"$config"
   rm -f "$tmp"
 }
 
@@ -611,7 +656,7 @@ run_login() { # flag — Ctrl-C cancels the login only, not the whole script
 # ─── screens ────────────────────────────────────────────────────────────────
 
 status_block() { # printed; capture with $(...)
-  local port strategy affinity proxy routing_line affinity_line
+  local port strategy affinity proxy routing_line affinity_line switch_line
   port="$(yaml_root port)"
   strategy="$(strategy_now)"
   affinity="$(routing_value session-affinity)"
@@ -631,11 +676,17 @@ status_block() { # printed; capture with $(...)
   else
     affinity_line="$(paint 10 "off")  $(paint "$MUTED" "strict order")"
   fi
+  if [[ "$(switch_mode)" == limits ]]; then
+    switch_line="$(paint 10 "on limits")  $(paint "$MUTED" "only a usage limit (429) moves to the next")"
+  else
+    switch_line="$(paint 11 "on any error")  $(paint "$MUTED" "network drops and 5xx errors also switch")"
+  fi
 
   echo
   printf '   %s  %s\n' "$(paint "" 'Proxy   ' bold)" "$proxy"
   printf '   %s  %s\n' "$(paint "" 'Routing ' bold)" "$routing_line"
   printf '   %s  %s\n' "$(paint "" 'Affinity' bold)" "$affinity_line"
+  printf '   %s  %s\n' "$(paint "" 'Switch  ' bold)" "$switch_line"
   printf '   %s  %s\n' "$(paint "" 'Config  ' bold)" "$(paint "$MUTED" "$config")"
   echo
 
@@ -882,19 +933,25 @@ remove_account() {
 }
 
 routing_settings() {
-  local strategy affinity current_s current_a
+  local strategy affinity switching current_s current_a current_w
   page "Routing" "$ACCENT" \
     "$(paint "" "Fill-first " bold)  one account until its limit, then the next $(paint "$MUTED" "(recommended)")" \
     "$(paint "" "Round-robin" bold)  spread every request across all accounts" \
     "" \
     "$(paint "" "Session affinity" bold)  keep a conversation on the account it started on." \
     "$(paint "$MUTED" "Better prompt caching, but a chat can stay on a later account after")" \
-    "$(paint "$MUTED" "an earlier one resets. Off: every request follows the order strictly.")"
+    "$(paint "$MUTED" "an earlier one resets. Off: every request follows the order strictly.")" \
+    "" \
+    "$(paint "" "Switch accounts" bold)  when traffic moves to the next account." \
+    "$(paint "$MUTED" "On usage limits: only a 429 rate limit hands over. On any error:")" \
+    "$(paint "$MUTED" "network drops and Anthropic/OpenAI 5xx errors also hand over.")"
 
   current_s="Fill-first"
   [[ "$(strategy_now)" == fill-first ]] || current_s="Round-robin"
   current_a="Off — strict order"
   [[ "$(routing_value session-affinity)" != true ]] || current_a="On — keep chats on their account"
+  current_w="Only on usage limits (429)"
+  [[ "$(switch_mode)" == limits ]] || current_w="On any error"
 
   strategy="$(gum choose --header "Routing strategy" --label-delimiter "|" --cursor "❯ " --selected "$current_s" \
     "Fill-first|fill-first" \
@@ -902,11 +959,14 @@ routing_settings() {
   affinity="$(gum choose --header "Session affinity" --label-delimiter "|" --cursor "❯ " --selected "$current_a" \
     "Off — strict order|false" \
     "On — keep chats on their account|true")" || return 0
+  switching="$(gum choose --header "Switch accounts" --label-delimiter "|" --cursor "❯ " --selected "$current_w" \
+    "Only on usage limits (429)|limits" \
+    "On any error|any")" || return 0
 
   echo
-  if write_routing "$strategy" "$affinity"; then
+  if write_routing "$strategy" "$affinity" && write_switching "$switching"; then
     sync_priorities
-    ok "Routing: $strategy · session affinity: $([[ "$affinity" == true ]] && echo on || echo off)"
+    ok "Routing: $strategy · session affinity: $([[ "$affinity" == true ]] && echo on || echo off) · switch: $([[ "$switching" == limits ]] && echo "on limits" || echo "on any error")"
     note "CLIProxyAPI reloads the config automatically. Backup: $backup"
   fi
   pause
@@ -921,10 +981,23 @@ first_run_checks() {
       "Fill-first uses one account until it hits its limit, then the next," \
       "so each subscription's usage window is used in turn." \
       "" \
-      "$(paint "$MUTED" "Session affinity is turned off so the order is followed strictly.")"
+      "$(paint "$MUTED" "Session affinity is turned off so the order is followed strictly,")" \
+      "$(paint "$MUTED" "and accounts switch only on usage limits, not on network errors.")"
     if gum confirm "  Switch to fill-first?"; then
       echo
-      if write_routing fill-first false; then ok "Fill-first enabled (config backup: $backup)"; fi
+      if write_routing fill-first false && write_switching limits; then ok "Fill-first enabled (config backup: $backup)"; fi
+      pause
+    fi
+  elif [[ "$(switch_mode)" != limits ]]; then
+    page "Switch accounts only on usage limits?" "$ACCENT" \
+      "Right now a network drop or an Anthropic/OpenAI 5xx error also moves" \
+      "requests to your next account, spending its usage early." \
+      "" \
+      "With this on, only a usage limit (429) hands over to the next account." \
+      "$(paint "$MUTED" "Sets max-retry-credentials: 1, transient-error-cooldown-seconds: -1.")"
+    if gum confirm "  Switch only on usage limits?"; then
+      echo
+      if write_switching limits; then ok "Accounts now switch only on usage limits (config backup: $backup)"; fi
       pause
     fi
   fi
